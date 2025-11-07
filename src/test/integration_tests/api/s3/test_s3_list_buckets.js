@@ -127,5 +127,78 @@ mocha.describe('s3_ops', function() {
         });
     });
 
+    mocha.describe('list_buckets permissions', function() {
+        this.timeout(60000);
+        let s3_user;
+        const test_user = 'test-user';
+        const user_bucket = 'user-buck';
+        const admin_bucket = 'admin-buck';
+
+        mocha.before(async function() {
+            const account = await rpc_client.account.create_account({
+                name: test_user,
+                email: test_user,
+                has_login: false,
+                s3_access: true,
+                default_resource: coretest.POOL_LIST[0].name
+            });
+
+            s3_user = new S3Client({
+                ...s3_client_params,
+                credentials: {
+                    accessKeyId: account.access_keys[0].access_key.unwrap(),
+                    secretAccessKey: account.access_keys[0].secret_key.unwrap(),
+                }
+            });
+
+            await s3_user.send(new CreateBucketCommand({ Bucket: user_bucket }));
+            await s3.send(new CreateBucketCommand({ Bucket: admin_bucket }));
+        });
+
+        mocha.after(async function() {
+            await s3_user.send(new DeleteBucketCommand({ Bucket: user_bucket }));
+            await s3.send(new DeleteBucketCommand({ Bucket: admin_bucket }));
+            await rpc_client.account.delete_account({ email: test_user });
+        });
+
+        mocha.it('user should list only owned buckets', async function() {
+            const buckets = (await s3_user.send(new ListBucketsCommand())).Buckets.map(b => b.Name);
+            assert(buckets.includes(user_bucket) && !buckets.includes(admin_bucket));
+        });
+
+        mocha.it('admin should list all buckets', async function() {
+            const buckets = (await s3.send(new ListBucketsCommand())).Buckets.map(b => b.Name);
+            assert(buckets.length >= 2);
+            assert(buckets.includes(user_bucket));
+            assert(buckets.includes(admin_bucket));
+        });
+
+        mocha.it('bucket policy grants list access', async function() {
+            let buckets = (await s3_user.send(new ListBucketsCommand())).Buckets.map(b => b.Name);
+            assert(!buckets.includes(admin_bucket));
+
+            await rpc_client.bucket.put_bucket_policy({
+                name: admin_bucket,
+                policy: {
+                    Version: '2012-10-17',
+                    Statement: [{
+                        Effect: 'Allow',
+                        Principal: { AWS: test_user },
+                        Action: ['s3:ListBucket'],
+                        Resource: [`arn:aws:s3:::${admin_bucket}`]
+                    }]
+                }
+            });
+
+            buckets = (await s3_user.send(new ListBucketsCommand())).Buckets.map(b => b.Name);
+            assert(buckets.includes(admin_bucket));
+
+            await rpc_client.bucket.delete_bucket_policy({ name: admin_bucket });
+
+            buckets = (await s3_user.send(new ListBucketsCommand())).Buckets.map(b => b.Name);
+            assert(!buckets.includes(admin_bucket));
+        });
+    });
+
 });
 
