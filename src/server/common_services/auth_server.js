@@ -495,6 +495,10 @@ function _prepare_auth_request(req) {
     req.has_bucket_action_permission = async function(bucket, action, bucket_path, req_query) {
         return has_bucket_action_permission(bucket, req.account, action, req_query, bucket_path);
     };
+
+    req.has_list_bucket_permission = function(bucket) {
+        return has_list_bucket_permission(bucket, req.account, req.system);
+    };
 }
 
 function _get_auth_info(account, system, authorized_by, role, extra) {
@@ -520,6 +524,51 @@ function _get_auth_info(account, system, authorized_by, role, extra) {
 }
 
 /**
+ * is_system_owner checks if the account is the system owner
+ * @param {Record<string, any>} system
+ * @param {Record<string, any>} account
+ * @returns {boolean}
+ */
+function is_system_owner(system, account) {
+    return system?.owner?.email?.unwrap() === account?.email?.unwrap();
+}
+
+/**
+ * is_bucket_owner checks if the account owns the bucket
+ * @param {Record<string, any>} bucket
+ * @param {Record<string, any>} account
+ * @returns {boolean}
+ */
+function is_bucket_owner(bucket, account) {
+    // check direct ownership
+    if (bucket?.owner_account?.email?.unwrap() === account?.email?.unwrap()) return true;
+
+    // check bucket claim ownership (OBC)
+    return account?.bucket_claim_owner?.name?.unwrap() === bucket?.name?.unwrap();
+}
+
+/**
+ * has_list_bucket_permission returns true if the account can list the bucket in ListBuckets operation
+ * this is a synchronous function that only checks system ownership and bucket ownership
+ *
+ * @param {Record<string, any>} bucket
+ * @param {Record<string, any>} account
+ * @param {Record<string, any>} system
+ * @returns {boolean}
+ */
+function has_list_bucket_permission(bucket, account, system) {
+    // system owner can list all the buckets
+    if (is_system_owner(bucket.system, account)) return true;
+
+    // bucket owner can list their buckets only
+    if (is_bucket_owner(bucket, account)) return true;
+
+    // TODO: Add IAM policy support for s3:ListAllMyBuckets action
+
+    return false;
+}
+
+/**
  * has_bucket_action_permission returns true if the requesting account has permission to perform
  * the given action on the given bucket.
  *
@@ -536,20 +585,16 @@ function _get_auth_info(account, system, authorized_by, role, extra) {
  * @returns  {Promise<boolean>} true if the account has permission to perform the action on the bucket
  */
 async function has_bucket_action_permission(bucket, account, action, req_query, bucket_path = "") {
-    if (!account || !account.email) {
-        dbg.warn('has_bucket_action_permission: account or account.email is missing');
-        return false;
-    }
     dbg.log1('has_bucket_action_permission:', bucket.name, account.email, bucket.owner_account.email);
 
-    // If the system owner account wants to access the bucket, allow it
-    if (bucket.system.owner.email.unwrap() === account.email.unwrap()) return true;
+    // system owner can access all buckets
+    if (is_system_owner(bucket.system, account)) return true;
 
-    const is_owner = (bucket.owner_account.email.unwrap() === account.email.unwrap()) ||
-        (account.bucket_claim_owner && account.bucket_claim_owner.name.unwrap() === bucket.name.unwrap());
+    // check bucket ownership
+    const owner = is_bucket_owner(bucket, account);
     const bucket_policy = bucket.s3_policy;
 
-    if (!bucket_policy) return is_owner;
+    if (!bucket_policy) return owner;
     if (!action) {
         throw new Error('has_bucket_action_permission: action is required');
     }
@@ -563,9 +608,8 @@ async function has_bucket_action_permission(bucket, account, action, req_query, 
     );
 
     if (result === 'DENY') return false;
-    if (result === 'ALLOW') return true;
 
-    return is_owner;
+    return owner || result === 'ALLOW';
 }
 
 /**
