@@ -271,9 +271,9 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
                 if (err.rpc_code !== 'NO_SUCH_BUCKET') throw err;
             }
             if (!bucket) return;
-            const bucket_policy_accessible = await this.has_bucket_action_permission(bucket, account, 's3:ListBucket');
-            dbg.log2(`list_buckets: bucket_name ${bucket_name} bucket_policy_accessible`, bucket_policy_accessible);
-            if (!bucket_policy_accessible) return;
+
+            if (!this.has_list_bucket_permission(bucket, account)) return;
+
             const fs_accessible = await this.validate_fs_bucket_access(bucket, object_sdk);
             if (!fs_accessible) return;
             return bucket;
@@ -921,25 +921,66 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
     ///// UTILS /////
     /////////////////
 
-    // TODO: move the following 3 functions - has_bucket_action_permission(), validate_fs_bucket_access(), _has_access_to_nsfs_dir()
+    // TODO: move the following 5 functions - is_system_owner(), is_bucket_owner(), has_list_bucket_permission(), has_bucket_action_permission(), validate_fs_bucket_access(), _has_access_to_nsfs_dir()
     // so they can be re-used
+
+    /**
+     * is_system_owner checks if the account is the system owner
+     * @param {Record<string, any>} bucket
+     * @param {Record<string, any>} account
+     * @returns {boolean}
+     */
+    is_system_owner(bucket, account) {
+        return Boolean(bucket?.system_owner) && bucket.system_owner.unwrap() === account?.name?.unwrap();
+    }
+
+    /**
+     * is_bucket_owner checks if the account owns the bucket
+     * @param {Record<string, any>} bucket
+     * @param {Record<string, any>} account
+     * @returns {boolean}
+     */
+    is_bucket_owner(bucket, account) {
+        // check direct ownership
+        if (bucket?.owner_account?.id === account?._id) return true;
+
+        // check IAM account with same root owner
+        if (account?.owner && bucket?.owner_account?.id === account.owner) return true;
+
+        return false;
+    }
+
+    /**
+     * has_list_bucket_permission returns true if the account can list the bucket in ListBuckets operation
+     * this is a synchronous function that only checks system ownership and bucket ownership
+     *
+     * @param {Record<string, any>} bucket
+     * @param {Record<string, any>} account
+     * @returns {boolean}
+     */
+    has_list_bucket_permission(bucket, account) {
+        // system owner can list all the buckets
+        if (this.is_system_owner(bucket, account)) return true;
+
+        // bucket owner can list their buckets only
+        if (this.is_bucket_owner(bucket, account)) return true;
+
+        // TODO: Add IAM policy support for s3:ListAllMyBuckets action
+
+        return false;
+    }
+
     async has_bucket_action_permission(bucket, account, action, bucket_path = "") {
         dbg.log1('has_bucket_action_permission:', bucket.name.unwrap(), account.name.unwrap(), account._id, bucket.bucket_owner.unwrap());
 
-        const is_system_owner = Boolean(bucket.system_owner) && bucket.system_owner.unwrap() === account.name.unwrap();
+        // system owner can access all buckets
+        if (this.is_system_owner(bucket, account)) return true;
 
-        // If the system owner account wants to access the bucket, allow it
-        if (is_system_owner) return true;
-        const is_owner = (bucket.owner_account && bucket.owner_account.id === account._id);
+        // check bucket ownership
+        const owner = this.is_bucket_owner(bucket, account);
         const bucket_policy = bucket.s3_policy;
 
-        if (!bucket_policy) {
-            // in case we do not have bucket policy
-            // we allow IAM account to access a bucket that that is owned by their root account
-            const is_iam_and_same_root_account_owner = account.owner !== undefined &&
-                account.owner === bucket.owner_account.id;
-            return is_owner || is_iam_and_same_root_account_owner;
-        }
+        if (!bucket_policy) return owner;
         if (!action) {
             throw new Error('has_bucket_action_permission: action is required');
         }
@@ -967,7 +1008,7 @@ class BucketSpaceFS extends BucketSpaceSimpleFS {
             );
         }
         if (permission_by_name === 'DENY') return false;
-        return is_owner || (permission_by_id === 'ALLOW' || permission_by_name === 'ALLOW');
+        return owner || (permission_by_id === 'ALLOW' || permission_by_name === 'ALLOW');
     }
 
     async validate_fs_bucket_access(bucket, object_sdk) {
